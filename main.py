@@ -205,12 +205,23 @@ async def render(
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid image file.")
 
-    # Resize to reduce cost + keep SD stable
-    pil = fit_max(pil, max_side=1100)
-
-    # SD inpaint requires width/height multiple of 64 :contentReference[oaicite:1]{index=1}
+    # Resize to SD-inpaint supported sizes:
+    # width/height must be one of: 64..1024 in steps of 64
     W, H = pil.size
-    W64, H64 = round_to_64(W), round_to_64(H)
+
+    max_dim = 1024
+    scale = min(max_dim / W, max_dim / H, 1.0)  # never upscale
+    new_w = int(W * scale)
+    new_h = int(H * scale)
+
+    # round DOWN to nearest multiple of 64 (must be >= 64)
+    new_w = max(64, (new_w // 64) * 64)
+    new_h = max(64, (new_h // 64) * 64)
+
+    # IMPORTANT: resize the actual image to match the exact dims we send to Replicate
+    pil = pil.resize((new_w, new_h), Image.LANCZOS)
+
+    W64, H64 = new_w, new_h
 
     original_data_url = img_to_data_url(pil, fmt="PNG")
 
