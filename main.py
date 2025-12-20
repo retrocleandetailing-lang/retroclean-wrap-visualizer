@@ -86,7 +86,6 @@ def health():
 
 @app.post("/render")
 async def render(
-    global LAST_CALL
 
     now = time.time()
     if now - LAST_CALL < COOLDOWN_SECONDS:
