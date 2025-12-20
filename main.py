@@ -3,8 +3,9 @@ import io
 import base64
 import time
 
-COOLDOWN_SECONDS = 12  # 6/min means 1 every 10s max; set 12 to be safe
+COOLDOWN_SECONDS = 20  # 6/min means 1 every 10s max; set 12 to be safe
 
+from starlette.requests import Request
 from typing import Literal
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
@@ -85,6 +86,7 @@ def health():
 
 @app.post("/render")
 async def render(
+    request: Request,
     image: UploadFile = File(...),
     angle: Angle = Form(...),
     color: str = Form(...),
@@ -93,16 +95,20 @@ async def render(
 ):
     # Rate limit / cooldown (prevents Replicate throttling)
     now = time.time()
-    if not hasattr(app.state, "last_call_ts"):
-        app.state.last_call_ts = 0.0
+    ip = request.client.host if request.client else "unknown"
 
-    if now - app.state.last_call_ts < COOLDOWN_SECONDS:
+    if not hasattr(app.state, "last_call_by_ip"):
+        app.state.last_call_by_ip = {}
+
+    last = app.state.last_call_by_ip.get(ip, 0.0)
+
+    if now - last < COOLDOWN_SECONDS:
         raise HTTPException(
             status_code=429,
-            detail="Too many requests. Please wait 10–15 seconds and try again."
+            detail="Too many requests. Please wait about 20–30 seconds and try again."
         )
 
-    app.state.last_call_ts = now
+    app.state.last_call_by_ip[ip] = now
 
     # Validate
     if color not in COLOR_MAP:
