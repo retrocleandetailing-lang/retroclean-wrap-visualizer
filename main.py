@@ -63,17 +63,12 @@ app = FastAPI(title="RetroClean Wrap Visualizer API")
 # Allow your Webflow domains
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://retrocleandetailing.com",
-        "https://www.retrocleandetailing.com",
-        # Webflow staging domains sometimes use webflow.io for previews:
-        "https://webflow.com",
-        "https://*.webflow.io",
-    ],
+    allow_origins=["*"],  # TESTING ONLY
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 @app.get("/health")
 def health():
