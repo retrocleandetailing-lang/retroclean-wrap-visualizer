@@ -86,18 +86,31 @@ def health():
 
 @app.post("/render")
 async def render(
-    
-    global LAST_CALL_TS
+    image: UploadFile = File(...),
+    angle: Angle = Form(...),
+    color: str = Form(...),
+    finish: Finish = Form(...),
+    strength: float = Form(0.45),
+):
+    # Rate limit / cooldown (prevents Replicate throttling)
     now = time.time()
-    if now - LAST_CALL_TS < COOLDOWN_SECONDS:
+    if not hasattr(app.state, "last_call_ts"):
+        app.state.last_call_ts = 0.0
+
+    if now - app.state.last_call_ts < COOLDOWN_SECONDS:
         raise HTTPException(
             status_code=429,
             detail="Too many requests. Please wait 10–15 seconds and try again."
         )
-    LAST_CALL_TS = now
 
-    image: UploadFile = File(...),
-    angle: Angle = Form(...),
+    app.state.last_call_ts = now
+
+    # --- your existing logic continues below ---
+    if color not in COLOR_MAP:
+        raise HTTPException(400, "Unsupported color.")
+
+    # (leave the rest of your code exactly as-is)
+    
     color: str = Form(...),
     finish: Finish = Form(...),
     strength: float = Form(0.45),
