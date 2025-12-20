@@ -104,58 +104,45 @@ async def render(
 
     app.state.last_call_ts = now
 
-    # --- your existing logic continues below ---
+    # Validate
     if color not in COLOR_MAP:
-        raise HTTPException(400, "Unsupported color.")
+        raise HTTPException(status_code=400, detail="Unsupported color.")
 
-    # (leave the rest of your code exactly as-is)
-    
-    color: str = Form(...),
-    finish: Finish = Form(...),
-    strength: float = Form(0.45),
-):
-    # 1) Validate
-    if color not in COLOR_MAP:
-        raise HTTPException(400, "Unsupported color.")
-
-    # 2) Load image
+    # Load image
     try:
         data = await image.read()
         pil = Image.open(io.BytesIO(data)).convert("RGB")
         w, h = pil.size
         if w < 900 or h < 900:
-            raise HTTPException(400, "Photo too small. Use at least ~900px on each side.")
+            raise HTTPException(status_code=400, detail="Photo too small. Use at least ~900px on each side.")
         if w > 5000 or h > 5000:
             pil.thumbnail((5000, 5000))
     except HTTPException:
         raise
     except Exception:
-        raise HTTPException(400, "Invalid image file.")
+        raise HTTPException(status_code=400, detail="Invalid image file.")
 
-    # 3) Read secrets from environment (set these in Render)
-    # Replicate token
+    # Read secrets from environment (set these in Render)
     token = os.getenv("REPLICATE_API_TOKEN")
     if not token:
-        raise HTTPException(500, "Missing REPLICATE_API_TOKEN on server.")
+        raise HTTPException(status_code=500, detail="Missing REPLICATE_API_TOKEN on server.")
     os.environ["REPLICATE_API_TOKEN"] = token
 
-    # Replicate model version IDs (you will paste these from Replicate)
     seg_version = os.getenv("REPLICATE_SEG_VERSION")
     img_version = os.getenv("REPLICATE_IMG_VERSION")
     if not seg_version or not img_version:
-        raise HTTPException(500, "Missing REPLICATE_SEG_VERSION or REPLICATE_IMG_VERSION on server.")
+        raise HTTPException(status_code=500, detail="Missing REPLICATE_SEG_VERSION or REPLICATE_IMG_VERSION on server.")
 
     original_data_url = img_to_data_url(pil, fmt="JPEG")
 
-    # 4) Segmentation (make a mask)
-    # NOTE: different models return different output formats. We handle common cases.
+    # Segmentation model requires text_prompt
     seg_out = replicate.run(
-    seg_version,
-    input={
-        "image": original_data_url,
-        "text_prompt": "car"
-    }
-)
+        seg_version,
+        input={
+            "image": original_data_url,
+            "text_prompt": "car",
+        },
+    )
 
     mask_url = None
     if isinstance(seg_out, dict):
@@ -166,9 +153,8 @@ async def render(
         mask_url = seg_out
 
     if not mask_url:
-        raise HTTPException(500, "Segmentation failed (no mask returned).")
+        raise HTTPException(status_code=500, detail="Segmentation failed (no mask returned).")
 
-    # 5) Image-to-image with mask (recolor wrap)
     prompt = build_prompt(COLOR_MAP[color], finish, angle)
 
     out = replicate.run(
@@ -190,10 +176,6 @@ async def render(
         result_url = out
 
     if not result_url:
-        raise HTTPException(500, "Render failed (no image returned).")
+        raise HTTPException(status_code=500, detail="Render failed (no image returned).")
 
-    return {
-        "before": original_data_url,
-        "after": result_url,
-        "mask": mask_url,
-    }
+    return {"before": original_data_url, "after": result_url, "mask": mask_url}
