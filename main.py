@@ -177,6 +177,7 @@ except ReplicateError as e:
 
     prompt = build_prompt(COLOR_MAP[color], finish, angle)
 
+try:
     out = replicate.run(
         img_version,
         input={
@@ -187,6 +188,11 @@ except ReplicateError as e:
             "strength": float(strength),
             "num_outputs": 1,
         },
+    )
+except ReplicateError as e:
+    raise HTTPException(
+        status_code=429,
+        detail="AI is busy right now (step 2/2). Please wait about 60 seconds and try again."
     )
 
     result_url = None
