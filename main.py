@@ -83,6 +83,13 @@ app.add_middleware(
 @app.get("/health")
 def health():
     return {"ok": True}
+    
+@app.get("/debug-token")
+def debug_token():
+    tok = os.getenv("REPLICATE_API_TOKEN", "")
+    if not tok:
+        return {"token_present": False}
+    return {"token_present": True, "token_prefix": tok[:6], "token_suffix": tok[-4:]}
 
 @app.post("/render")
 async def render(
