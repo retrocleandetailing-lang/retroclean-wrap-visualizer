@@ -150,7 +150,7 @@ async def render(
     try:
         seg_out = replicate.run(
             seg_version,
-            input={"image": original_data_url, "text_prompt": "car"},
+            input={"image": original_data_url, "text_prompt": "car body"},
         )
     except ReplicateError as e:
         raise HTTPException(status_code=429, detail=f"Replicate error (step 1/2): {e}")
