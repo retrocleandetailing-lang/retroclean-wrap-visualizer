@@ -253,7 +253,7 @@ async def render(
     mask_data_url = img_to_data_url(mask_img, fmt="PNG")
 
     # Replicate “burst of 1” is common; spacing helps if they throttle
-    time.sleep(2)
+    time.sleep(12)
 
     # 2) Inpainting (Stable Diffusion Inpainting)
     prompt = build_prompt(COLOR_MAP[color], finish, angle)
