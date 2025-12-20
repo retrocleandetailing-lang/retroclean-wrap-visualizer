@@ -166,6 +166,9 @@ async def render(
     if not mask_url:
         raise HTTPException(status_code=500, detail="Segmentation failed (no mask returned).")
 
+    time.sleep(12)  # wait to satisfy Replicate burst limit
+        
+
     # 2) Wrap render
     prompt = build_prompt(COLOR_MAP[color], finish, angle)
 
