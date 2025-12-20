@@ -237,7 +237,9 @@ async def render(
     # Replicate inpainting: WHITE = inpaint, BLACK = preserve.
     # We want to inpaint ONLY the body panels.
     mask_data_url = img_to_data_url(cleaned_mask, fmt="PNG")
-
+   
+    time.sleep(12)  # wait to satisfy Replicate burst limit
+    
     # 2) Inpainting model (realistic wrap)
     prompt = build_prompt(COLOR_MAP[color], finish, angle)
 
