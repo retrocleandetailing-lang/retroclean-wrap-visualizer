@@ -181,7 +181,7 @@ async def render(
                 "num_outputs": 1,
             },
         )
-except ReplicateError as e:
+    except ReplicateError as e:
     raise HTTPException(status_code=429, detail=f"Replicate error (step 2/2): {e}")
 
     result_url = None
