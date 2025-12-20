@@ -3,7 +3,7 @@ import io
 import base64
 import time
 
-COOLDOWN_SECONDS = 20  # 6/min means 1 every 10s max; set 12 to be safe
+COOLDOWN_SECONDS = 60  # 6/min means 1 every 10s max; set 12 to be safe
 
 from starlette.requests import Request
 from typing import Literal
@@ -78,7 +78,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
+@app.get("/")
+def root():
+    return {"message": "RetroClean Wrap Visualizer API. Use /health or POST /render."}
 
 
 @app.get("/health")
@@ -91,9 +93,6 @@ def debug_token():
     if not tok:
         return {"token_present": False}
     return {"token_present": True, "token_prefix": tok[:6], "token_suffix": tok[-4:]}
-
-from replicate.exceptions import ReplicateError  # make sure this import exists at top
-
 
 @app.post("/render")
 async def render(
@@ -153,8 +152,8 @@ async def render(
             seg_version,
             input={"image": original_data_url, "text_prompt": "car"},
         )
-    except ReplicateError:
-        raise HTTPException(status_code=429, detail="AI is busy (step 1/2). Please wait ~60 seconds and try again.")
+except ReplicateError as e:
+    raise HTTPException(status_code=429, detail=f"Replicate error (step 1/2): {e}")
 
     mask_url = None
     if isinstance(seg_out, dict):
@@ -182,8 +181,8 @@ async def render(
                 "num_outputs": 1,
             },
         )
-    except ReplicateError:
-        raise HTTPException(status_code=429, detail="AI is busy (step 2/2). Please wait ~60 seconds and try again.")
+except ReplicateError as e:
+    raise HTTPException(status_code=429, detail=f"Replicate error (step 2/2): {e}")
 
     result_url = None
     if isinstance(out, list) and out:
