@@ -1,3 +1,4 @@
+
 import os
 import io
 import base64
@@ -7,7 +8,7 @@ from typing import Literal
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageChops, ImageFilter
 
 import replicate
 from replicate.exceptions import ReplicateError
@@ -78,17 +79,15 @@ def build_prompt(color_name: str, finish: Finish, angle: Angle) -> str:
             "(do NOT look glittery; keep it premium and realistic). "
         )
 
+    # Keep prompt strict and non-creative
     return (
-        f"Photorealistic wrap preview of the SAME car photo. "
-        f"Keep the same car make/model, same exact camera perspective ({angle_hint}), "
-        f"same background and lighting. "
-        f"ONLY change the painted body panels (doors, fenders, hood, quarter panels, bumpers) "
-        f"to {color_name} {finish_text}. "
+        f"Repaint ONLY the visible car body panels (doors, fenders, hood, quarter panels, bumpers) "
+        f"with a {color_name} {finish_text}. "
         f"{flake}"
-        f"Preserve all panel gaps and seam lines (door lines, hood lines, trunk lines) clearly. "
-        f"Do NOT change wheels, tires, brakes, headlights, taillights, windows, windshield, trim, badges, grille, or interior. "
-        f"Do NOT change the environment. "
-        f"Maintain original reflections shape and realism, just recolor the painted panels."
+        f"Preserve original panel gaps and seam lines (door lines, hood lines, trunk lines) clearly. "
+        f"Do not change car make/model/year, body shape, camera perspective ({angle_hint}), background, lighting, or reflections shape. "
+        f"Do not change wheels, tires, brakes, headlights, taillights, glass/windows, trim, badges, grille, mirrors, or interior. "
+        f"This is a repaint of the same photo, not a new car."
     )
 
 
@@ -103,32 +102,27 @@ def negative_prompt() -> str:
 def refine_mask_reduce_windows_wheels(original_rgb: Image.Image, mask_l: Image.Image) -> Image.Image:
     """
     Heuristic cleanup:
-    - Windows + wheels are often very dark and low-saturation.
-    - We remove very-dark & low-sat pixels from the mask area using the original image.
-    This is not perfect, but usually improves the “blue wheels / tinted glass” problem a lot.
+    - Windows + wheels are often very dark and/or low-saturation.
+    - We remove very-dark & low-sat pixels from the inpaint mask using the original image.
+    WHITE = inpaint, BLACK = preserve.
     """
-    # Ensure same size
     mask = mask_l.resize(original_rgb.size).convert("L")
     mask = ImageOps.autocontrast(mask)
 
-    # Convert to HSV for saturation/value
     hsv = original_rgb.convert("HSV")
-    h, s, v = hsv.split()
+    _, s, v = hsv.split()
 
-    # Create "keep" map: keep pixels that are NOT both (very dark) and (low sat)
-    # Tuned for car photos; adjust if needed.
-    # v: 0-255 (brightness), s: 0-255 (saturation)
+    # Thresholds tuned for typical car photos
     v_ok = v.point(lambda px: 255 if px > 55 else 0)
     s_ok = s.point(lambda px: 255 if px > 35 else 0)
 
     # keep_if = v_ok OR s_ok
     keep_if = ImageChops.lighter(v_ok, s_ok)
 
-    # Only apply inside the original mask region:
-    # cleaned_mask = mask AND keep_if
+    # Apply only inside current mask: cleaned = mask AND keep_if
     cleaned = ImageChops.multiply(mask, keep_if)
 
-    # Slight blur/threshold to smooth edges (no hard jaggies)
+    # Smooth edges + threshold
     cleaned = cleaned.filter(ImageFilter.GaussianBlur(radius=1.2))
     cleaned = cleaned.point(lambda px: 255 if px > 110 else 0)
 
@@ -151,13 +145,16 @@ async def render(
     angle: Angle = Form(...),
     color: str = Form(...),
     finish: Finish = Form(...),
-    strength: float = Form(0.55),
+    strength: float = Form(0.25),  # backend default; Webflow can override if needed
 ):
     # Server-side cooldown
     now = time.time()
     last = getattr(app.state, "last_call_ts", 0.0)
     if now - last < COOLDOWN_SECONDS:
-        raise HTTPException(status_code=429, detail=f"Too many requests. Please wait ~{COOLDOWN_SECONDS}s and try again.")
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many requests. Please wait ~{COOLDOWN_SECONDS}s and try again.",
+        )
     app.state.last_call_ts = now
 
     if color not in COLOR_MAP:
@@ -170,6 +167,7 @@ async def render(
         w, h = pil.size
         if w < 900 or h < 900:
             raise HTTPException(status_code=400, detail="Photo too small. Use at least ~900px on each side.")
+        # Keep size reasonable (faster + more consistent)
         if w > 2200 or h > 2200:
             pil.thumbnail((2200, 2200))
     except HTTPException:
@@ -184,15 +182,17 @@ async def render(
 
     if not token:
         raise HTTPException(status_code=500, detail="Missing REPLICATE_API_TOKEN on server.")
-    if not seg_version or not img_version:
-        raise HTTPException(status_code=500, detail="Missing REPLICATE_SEG_VERSION or REPLICATE_IMG_VERSION on server.")
+    if not seg_version:
+        raise HTTPException(status_code=500, detail="Missing REPLICATE_SEG_VERSION on server.")
+    if not img_version:
+        raise HTTPException(status_code=500, detail="Missing REPLICATE_IMG_VERSION on server.")
 
     os.environ["REPLICATE_API_TOKEN"] = token
 
-    # Convert original image to data URL (PNG is safest for Replicate image inputs)
+    # Convert original image to data URL (PNG is safest)
     original_data_url = img_to_data_url(pil, fmt="PNG")
 
-    # 1) Segmentation (try to focus on body panels)
+    # 1) Segmentation
     try:
         seg_out = replicate.run(
             seg_version,
@@ -222,48 +222,49 @@ async def render(
     except Exception:
         raise HTTPException(status_code=500, detail="Could not download segmentation mask.")
 
-    # --- Optional: heuristic cleanup to reduce windows/wheels bleed ---
-    # These imports are here to avoid unused warnings if you remove the cleanup.
-    from PIL import ImageChops, ImageFilter
     cleaned_mask = mask_img.resize(pil.size).convert("L")
     cleaned_mask = ImageOps.autocontrast(cleaned_mask)
 
-    # Try cleanup (safe fallback if anything goes wrong)
+    # Optional: heuristic cleanup to reduce windows/wheels bleed
     try:
         cleaned_mask = refine_mask_reduce_windows_wheels(pil, cleaned_mask)
     except Exception:
-        pass
+        # If heuristic fails, fall back to raw mask
+        cleaned_mask = mask_img.resize(pil.size).convert("L")
+        cleaned_mask = ImageOps.autocontrast(cleaned_mask)
 
     # Replicate inpainting: WHITE = inpaint, BLACK = preserve.
-    # We want to inpaint ONLY the body panels.
     mask_data_url = img_to_data_url(cleaned_mask, fmt="PNG")
-   
-    time.sleep(12)  # wait to satisfy Replicate burst limit
-    
-    # 2) Inpainting model (realistic wrap)
+
+    # Small delay to satisfy Replicate burst behavior
+    time.sleep(12)
+
+    # 2) Inpainting model
     prompt = build_prompt(COLOR_MAP[color], finish, angle)
 
-    # Slightly different defaults by finish
-    guidance = 7.5
-    steps = 30
-    if finish == "matte":
-        guidance = 7.0
-        steps = 28
+    # Clamp strength to safe range (prevents hallucinated “new cars”)
+    try:
+        strength_val = float(strength)
+    except Exception:
+        strength_val = 0.25
+    strength_val = max(0.15, min(0.35, strength_val))
+
+    # Use conservative settings to keep the SAME car
+    guidance_scale = 5.5
+    steps = 28
 
     try:
         out = replicate.run(
             img_version,
             input={
-                "prompt": prompt,
                 "image": original_data_url,
                 "mask": mask_data_url,
+                "prompt": prompt,
                 "negative_prompt": negative_prompt(),
-                "num_outputs": 1,
+                "strength": strength_val,
+                "guidance_scale": guidance_scale,
                 "num_inference_steps": steps,
-                "guidance_scale": guidance,
-                # Many SD inpaint models use prompt_strength; your provided strength can map to it.
-                # If your chosen version doesn't support it, remove this line.
-                "prompt_strength": float(strength),
+                "num_outputs": 1,
             },
         )
     except ReplicateError as e:
