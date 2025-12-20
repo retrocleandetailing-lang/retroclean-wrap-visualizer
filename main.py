@@ -153,7 +153,7 @@ async def render(
             input={"image": original_data_url, "text_prompt": "car"},
         )
     except ReplicateError as e:
-    raise HTTPException(status_code=429, detail=f"Replicate error (step 1/2): {e}")
+        raise HTTPException(status_code=429, detail=f"Replicate error (step 1/2): {e}")
 
     mask_url = None
     if isinstance(seg_out, dict):
@@ -182,7 +182,7 @@ async def render(
             },
         )
     except ReplicateError as e:
-    raise HTTPException(status_code=429, detail=f"Replicate error (step 2/2): {e}")
+        raise HTTPException(status_code=429, detail=f"Replicate error (step 2/2): {e}")
 
     result_url = None
     if isinstance(out, list) and out:
