@@ -3,7 +3,6 @@ import io
 import base64
 import time
 
-LAST_CALL = 0
 COOLDOWN_SECONDS = 12  # 6/min means 1 every 10s max; set 12 to be safe
 
 from typing import Literal
