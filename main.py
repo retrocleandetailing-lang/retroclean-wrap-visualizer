@@ -5,7 +5,7 @@ import time
 from typing import Literal
 
 import requests
-from PIL import Image, ImageOps, ImageEnhance
+from PIL import Image, ImageOps, ImageEnhance, ImageFilter, ImageChops
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,7 +17,7 @@ from replicate.exceptions import ReplicateError
 # -----------------------------
 # SETTINGS
 # -----------------------------
-COOLDOWN_SECONDS = 20  # 1 Replicate call per request now; 20s is a safe cooldown
+COOLDOWN_SECONDS = 20  # 1 replicate call per request; 20s is safe
 
 Angle = Literal["front_3q", "side", "rear_3q"]
 Finish = Literal["gloss", "satin", "matte"]
@@ -32,7 +32,6 @@ COLOR_MAP = {
     "pearl_white": "Pearl White",
 }
 
-# Hex colors for photoreal wrap overlays (tweak later)
 COLOR_HEX = {
     "nardo_grey": "#9FA4A9",
     "satin_black": "#1A1A1A",
@@ -57,6 +56,16 @@ def img_to_data_url(img: Image.Image, fmt: str = "JPEG") -> str:
 def hex_to_rgb(hexstr: str):
     hexstr = hexstr.strip().lstrip("#")
     return tuple(int(hexstr[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def screen_blend(a: Image.Image, b: Image.Image) -> Image.Image:
+    """Screen blend for RGB images (photographic highlight behavior)."""
+    inv = ImageChops.invert(ImageChops.multiply(ImageChops.invert(a), ImageChops.invert(b)))
+    return inv
+
+
+def clamp01(x: float) -> float:
+    return max(0.0, min(1.0, x))
 
 
 # -----------------------------
@@ -97,13 +106,13 @@ def debug_token():
 @app.post("/render")
 async def render(
     image: UploadFile = File(...),
-    angle: Angle = Form(...),     # currently unused in overlay mode, kept for UI compatibility
+    angle: Angle = Form(...),      # kept for UI; not needed for overlay method
     color: str = Form(...),
     finish: Finish = Form(...),
-    strength: float = Form(0.45), # we’ll map this to overlay intensity below
+    strength: float = Form(0.45),  # used as intensity control
 ):
     # -----------------------------
-    # Cooldown / basic rate limiting
+    # Cooldown
     # -----------------------------
     now = time.time()
     if not hasattr(app.state, "last_call_ts"):
@@ -114,7 +123,6 @@ async def render(
             status_code=429,
             detail=f"Too many requests. Please wait about {COOLDOWN_SECONDS} seconds and try again."
         )
-
     app.state.last_call_ts = now
 
     # -----------------------------
@@ -123,7 +131,6 @@ async def render(
     if color not in COLOR_MAP or color not in COLOR_HEX:
         raise HTTPException(status_code=400, detail="Unsupported color.")
 
-    # Clamp strength to safe range (we'll reuse it as overlay amount)
     try:
         strength = float(strength)
     except Exception:
@@ -147,7 +154,7 @@ async def render(
         raise HTTPException(status_code=400, detail="Invalid image file.")
 
     # -----------------------------
-    # Replicate token + model version
+    # Replicate env
     # -----------------------------
     token = os.getenv("REPLICATE_API_TOKEN")
     if not token:
@@ -158,25 +165,19 @@ async def render(
     if not seg_version:
         raise HTTPException(status_code=500, detail="Missing REPLICATE_SEG_VERSION on server.")
 
-    # Convert original image to data url (works with Replicate)
     original_data_url = img_to_data_url(pil, fmt="JPEG")
 
     # -----------------------------
-    # 1) Segmentation (Replicate)
+    # 1) Segmentation
     # -----------------------------
     try:
         seg_out = replicate.run(
             seg_version,
-            input={
-                "image": original_data_url,
-                "text_prompt": "car body",  # better than "car" for wraps
-            },
+            input={"image": original_data_url, "text_prompt": "car body"},
         )
     except ReplicateError as e:
-        # Bubble up as 429 so Webflow cooldown triggers nicely
         raise HTTPException(status_code=429, detail=f"Replicate segmentation error: {e}")
 
-    # Extract mask URL
     mask_url = None
     if isinstance(seg_out, dict):
         mask_url = seg_out.get("mask") or seg_out.get("output") or seg_out.get("mask_url")
@@ -189,7 +190,7 @@ async def render(
         raise HTTPException(status_code=500, detail="Segmentation failed (no mask returned).")
 
     # -----------------------------
-    # 2) Download mask image
+    # 2) Download & refine mask (remove windows/wheels)
     # -----------------------------
     try:
         mask_bytes = requests.get(str(mask_url), timeout=30).content
@@ -197,53 +198,101 @@ async def render(
     except Exception:
         raise HTTPException(status_code=500, detail="Could not download segmentation mask.")
 
-    # Ensure mask matches photo size
     mask_img = mask_img.resize(pil.size)
-
-    # Improve mask contrast
     mask = ImageOps.autocontrast(mask_img)
 
-    # Optional: soften edges slightly to reduce harsh boundaries
-    # (comment this out if you prefer sharper edges)
-    # mask = mask.filter(ImageFilter.GaussianBlur(radius=1))
+    # Heuristic removal: windows/tires are dark → subtract them from mask
+    gray_orig = ImageOps.grayscale(pil)
+    dark_regions = gray_orig.point(lambda p: 255 if p < 65 else 0)  # threshold tuned for car shots
+    dark_regions = dark_regions.filter(ImageFilter.GaussianBlur(radius=3))
+    mask = ImageChops.subtract(mask, dark_regions)
+
+    # Clean edges
+    mask = mask.filter(ImageFilter.GaussianBlur(radius=2))
+    mask = ImageOps.autocontrast(mask)
+
+    # Optional: keep only strong mask areas (reduces spill)
+    mask = mask.point(lambda p: 255 if p > 70 else 0).filter(ImageFilter.GaussianBlur(radius=1.5))
 
     # -----------------------------
-    # 3) Wrap color overlay (photoreal, preserves lighting)
+    # 3) Base wrap overlay (preserve lighting)
     # -----------------------------
-    target_hex = COLOR_HEX[color]
-    r, g, b = hex_to_rgb(target_hex)
+    r, g, b = hex_to_rgb(COLOR_HEX[color])
 
-    # Take luminance from original so reflections/shadows stay real
     base_gray = ImageOps.grayscale(pil)
-
-    # Colorize grayscale into target color while keeping shading
     colored = ImageOps.colorize(base_gray, black=(0, 0, 0), white=(r, g, b)).convert("RGB")
 
-    # Map "strength" to overlay intensity (lower strength = more subtle, higher = more color)
-    # Good range is ~0.55 to 0.85
-    overlay = 0.55 + (0.30 * strength)
+    # Intensity mapping
+    overlay_amt = 0.55 + (0.30 * strength)  # 0.55 → 0.82
+    overlay_amt = clamp01(overlay_amt)
 
-    blended = Image.blend(pil, colored, overlay)
+    blended = Image.blend(pil, colored, overlay_amt)
+    wrapped = Image.composite(blended, pil, mask)
 
-    # Composite ONLY on masked area
-    wrapped = Image.composite(
-        blended,
-        pil,
-        mask  # white areas apply wrap, black areas keep original
-    )
+    # -----------------------------
+    # 4) Panel separation (door/hood lines)
+    # -----------------------------
+    # Edge detect on grayscale, then apply only on wrapped areas
+    edges = gray_orig.filter(ImageFilter.FIND_EDGES)
+    edges = ImageOps.autocontrast(edges)
 
-    # Finish tweaks
+    # Keep only stronger edges (panel gaps)
+    edges = edges.point(lambda p: 255 if p > 140 else 0)
+    edges = edges.filter(ImageFilter.GaussianBlur(radius=1))
+
+    # Convert edges to a dark line layer
+    panel_lines = ImageOps.colorize(edges, black=(0, 0, 0), white=(0, 0, 0)).convert("RGB")
+
+    # Apply panel lines only where mask applies
+    panel_lines_only = Image.composite(panel_lines, Image.new("RGB", pil.size, (0, 0, 0)), mask)
+
+    # Multiply dark lines into wrapped (subtle)
+    wrapped = ImageChops.multiply(wrapped, ImageChops.invert(panel_lines_only).point(lambda p: max(0, p - 35)))
+
+    # -----------------------------
+    # 5) Metallic flake (gloss only)
+    # -----------------------------
     if finish == "gloss":
-        wrapped = ImageEnhance.Contrast(wrapped).enhance(1.08)
+        # Noise texture
+        noise = Image.effect_noise(pil.size, 22).convert("L")  # grain size
+        noise = ImageOps.autocontrast(noise).point(lambda p: 255 if p > 210 else 0)  # keep only bright specks
+        noise = noise.filter(ImageFilter.GaussianBlur(radius=0.6))
+
+        # Turn specks into near-white sparkle
+        sparkle = ImageOps.colorize(noise, black=(0, 0, 0), white=(240, 240, 240)).convert("RGB")
+        sparkle = Image.composite(sparkle, Image.new("RGB", pil.size, (0, 0, 0)), mask)
+
+        # Screen blend sparkle very lightly
+        wrapped = Image.blend(wrapped, screen_blend(wrapped, sparkle), 0.12)
+
+    # -----------------------------
+    # 6) Clearcoat highlights (gloss + satin)
+    # -----------------------------
+    if finish in ("gloss", "satin"):
+        # Extract highlights from original luminance
+        hi = gray_orig.point(lambda p: 255 if p > 200 else 0)
+        hi = hi.filter(ImageFilter.GaussianBlur(radius=8))
+        hi = ImageOps.autocontrast(hi)
+
+        highlight_layer = ImageOps.colorize(hi, black=(0, 0, 0), white=(255, 255, 255)).convert("RGB")
+        highlight_layer = Image.composite(highlight_layer, Image.new("RGB", pil.size, (0, 0, 0)), mask)
+
+        strength_hi = 0.18 if finish == "gloss" else 0.10
+        wrapped = Image.blend(wrapped, screen_blend(wrapped, highlight_layer), strength_hi)
+
+    # -----------------------------
+    # 7) Finish tuning
+    # -----------------------------
+    if finish == "gloss":
+        wrapped = ImageEnhance.Contrast(wrapped).enhance(1.07)
         wrapped = ImageEnhance.Color(wrapped).enhance(1.12)
     elif finish == "satin":
         wrapped = ImageEnhance.Contrast(wrapped).enhance(1.03)
-        wrapped = ImageEnhance.Color(wrapped).enhance(1.05)
+        wrapped = ImageEnhance.Color(wrapped).enhance(1.06)
     elif finish == "matte":
-        wrapped = ImageEnhance.Contrast(wrapped).enhance(0.96)
+        wrapped = ImageEnhance.Contrast(wrapped).enhance(0.97)
         wrapped = ImageEnhance.Color(wrapped).enhance(0.92)
 
     after_data_url = img_to_data_url(wrapped, fmt="JPEG")
 
-    # Return data URLs so Webflow can display instantly
     return {"before": original_data_url, "after": after_data_url, "mask": str(mask_url)}
