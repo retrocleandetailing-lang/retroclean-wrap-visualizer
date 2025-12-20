@@ -85,6 +85,11 @@ def health():
     return {"ok": True}
 
 @app.post("/render")
+global LAST_CALL
+now = time.time()
+if now - LAST_CALL < COOLDOWN_SECONDS:
+    raise HTTPException(429, "Too many requests. Please wait 10–15 seconds and try again.")
+LAST_CALL = now
 async def render(
     image: UploadFile = File(...),
     angle: Angle = Form(...),
