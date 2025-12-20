@@ -5,6 +5,7 @@ import time
 
 COOLDOWN_SECONDS = 20  # 6/min means 1 every 10s max; set 12 to be safe
 
+from replicate.exceptions import ReplicateError
 from starlette.requests import Request
 from typing import Literal
 
