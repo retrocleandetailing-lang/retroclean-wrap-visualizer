@@ -5,7 +5,6 @@ import time
 
 COOLDOWN_SECONDS = 20  # 6/min means 1 every 10s max; set 12 to be safe
 
-from replicate.exceptions import ReplicateError
 from starlette.requests import Request
 from typing import Literal
 
@@ -13,6 +12,7 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 import replicate
+from replicate.exceptions import ReplicateError
 
 # IMPORTANT:
 # 1) Put your Replicate token into Render (Environment Variables), NOT in this file.
@@ -150,12 +150,18 @@ async def render(
     original_data_url = img_to_data_url(pil, fmt="JPEG")
 
     # Segmentation model requires text_prompt
+try:
     seg_out = replicate.run(
         seg_version,
         input={
             "image": original_data_url,
             "text_prompt": "car",
         },
+    )
+except ReplicateError as e:
+    raise HTTPException(
+        status_code=429,
+        detail="AI is busy right now (step 1/2). Please wait about 60 seconds and try again."
     )
 
     mask_url = None
