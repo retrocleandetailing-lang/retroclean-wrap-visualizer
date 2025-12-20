@@ -92,31 +92,29 @@ def debug_token():
         return {"token_present": False}
     return {"token_present": True, "token_prefix": tok[:6], "token_suffix": tok[-4:]}
 
+from replicate.exceptions import ReplicateError  # make sure this import exists at top
+
+
 @app.post("/render")
 async def render(
-    request: Request,
     image: UploadFile = File(...),
     angle: Angle = Form(...),
     color: str = Form(...),
     finish: Finish = Form(...),
     strength: float = Form(0.45),
 ):
-    # Rate limit / cooldown (prevents Replicate throttling)
+    # Cooldown to reduce Replicate throttling (2 predictions per request)
     now = time.time()
-    ip = request.client.host if request.client else "unknown"
+    if not hasattr(app.state, "last_call_ts"):
+        app.state.last_call_ts = 0.0
 
-    if not hasattr(app.state, "last_call_by_ip"):
-        app.state.last_call_by_ip = {}
-
-    last = app.state.last_call_by_ip.get(ip, 0.0)
-
-    if now - last < COOLDOWN_SECONDS:
+    if now - app.state.last_call_ts < COOLDOWN_SECONDS:
         raise HTTPException(
             status_code=429,
-            detail="Too many requests. Please wait about 20–30 seconds and try again."
+            detail="Too many requests. Please wait about 60 seconds and try again."
         )
 
-    app.state.last_call_by_ip[ip] = now
+    app.state.last_call_ts = now
 
     # Validate
     if color not in COLOR_MAP:
@@ -136,7 +134,7 @@ async def render(
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid image file.")
 
-    # Read secrets from environment (set these in Render)
+    # Secrets from environment
     token = os.getenv("REPLICATE_API_TOKEN")
     if not token:
         raise HTTPException(status_code=500, detail="Missing REPLICATE_API_TOKEN on server.")
@@ -149,20 +147,14 @@ async def render(
 
     original_data_url = img_to_data_url(pil, fmt="JPEG")
 
-    # Segmentation model requires text_prompt
-try:
-    seg_out = replicate.run(
-        seg_version,
-        input={
-            "image": original_data_url,
-            "text_prompt": "car",
-        },
-    )
-except ReplicateError as e:
-    raise HTTPException(
-        status_code=429,
-        detail="AI is busy right now (step 1/2). Please wait about 60 seconds and try again."
-    )
+    # 1) Segmentation
+    try:
+        seg_out = replicate.run(
+            seg_version,
+            input={"image": original_data_url, "text_prompt": "car"},
+        )
+    except ReplicateError:
+        raise HTTPException(status_code=429, detail="AI is busy (step 1/2). Please wait ~60 seconds and try again.")
 
     mask_url = None
     if isinstance(seg_out, dict):
@@ -175,25 +167,23 @@ except ReplicateError as e:
     if not mask_url:
         raise HTTPException(status_code=500, detail="Segmentation failed (no mask returned).")
 
+    # 2) Wrap render
     prompt = build_prompt(COLOR_MAP[color], finish, angle)
 
-try:
-    out = replicate.run(
-        img_version,
-        input={
-            "image": original_data_url,
-            "mask": mask_url,
-            "prompt": prompt,
-            "negative_prompt": negative_prompt(),
-            "strength": float(strength),
-            "num_outputs": 1,
-        },
-    )
-except ReplicateError as e:
-    raise HTTPException(
-        status_code=429,
-        detail="AI is busy right now (step 2/2). Please wait about 60 seconds and try again."
-    )
+    try:
+        out = replicate.run(
+            img_version,
+            input={
+                "image": original_data_url,
+                "mask": mask_url,
+                "prompt": prompt,
+                "negative_prompt": negative_prompt(),
+                "strength": float(strength),
+                "num_outputs": 1,
+            },
+        )
+    except ReplicateError:
+        raise HTTPException(status_code=429, detail="AI is busy (step 2/2). Please wait ~60 seconds and try again.")
 
     result_url = None
     if isinstance(out, list) and out:
