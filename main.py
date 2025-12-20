@@ -152,7 +152,7 @@ async def render(
             seg_version,
             input={"image": original_data_url, "text_prompt": "car"},
         )
-except ReplicateError as e:
+    except ReplicateError as e:
     raise HTTPException(status_code=429, detail=f"Replicate error (step 1/2): {e}")
 
     mask_url = None
