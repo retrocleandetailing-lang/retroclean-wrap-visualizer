@@ -123,9 +123,12 @@ async def render(
     # 4) Segmentation (make a mask)
     # NOTE: different models return different output formats. We handle common cases.
     seg_out = replicate.run(
-        seg_version,
-        input={"image": original_data_url}
-    )
+    seg_version,
+    input={
+        "image": original_data_url,
+        "text_prompt": "car"
+    }
+)
 
     mask_url = None
     if isinstance(seg_out, dict):
