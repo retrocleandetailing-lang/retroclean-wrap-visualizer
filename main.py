@@ -88,14 +88,20 @@ def build_prompt(color_name: str, finish: Finish, angle: Angle) -> str:
         f"Do not change car make/model/year, body shape, camera perspective ({angle_hint}), background, lighting, or reflections shape. "
         f"Do not change wheels, tires, brakes, headlights, taillights, glass/windows, trim, badges, grille, mirrors, or interior. "
         f"This is a repaint of the same photo, not a new car."
+        f"STRICT image edit. Do NOT generate a new car. "
+        f"Do NOT change vehicle identity. "
+        f"This is a recolor of the exact same photograph. "
+
     )
 
 
 def negative_prompt() -> str:
     return (
-        "different car, changed body kit, changed wheels, changed background, "
-        "cartoon, CGI, illustration, anime, warped panels, melted shapes, "
-        "extra parts, text, watermark, logo, blurry, low quality"
+        "new car, different car, different model, different brand, "
+        "redesign, restyle, concept car, vintage car, classic car, "
+        "changed grille, changed headlights, changed body shape, "
+        "changed badge, changed emblem, changed proportions, "
+        "cartoon, CGI, illustration, anime, low quality, blurry"
     )
 
 
@@ -246,27 +252,31 @@ async def render(
     try:
         strength_val = float(strength)
     except Exception:
-        strength_val = 0.25
+        strength_val = 0.12
     strength_val = max(0.15, min(0.35, strength_val))
 
     # Use conservative settings to keep the SAME car
-    guidance_scale = 5.5
-    steps = 28
+    guidance_scale = 3.8
+    steps = 22
 
     try:
         out = replicate.run(
-            img_version,
-            input={
-                "image": original_data_url,
-                "mask": mask_data_url,
-                "prompt": prompt,
-                "negative_prompt": negative_prompt(),
-                "strength": strength_val,
-                "guidance_scale": guidance_scale,
-                "num_inference_steps": steps,
-                "num_outputs": 1,
-            },
-        )
+        img_version,
+        input={
+            "image": original_data_url,
+            "mask": mask_data_url,
+
+            "prompt": prompt,
+            "negative_prompt": negative_prompt(),
+
+            # 🔒 VERY IMPORTANT — RECOLOR ONLY
+            "strength": 0.12,
+            "guidance_scale": 3.8,
+            "num_inference_steps": 22,
+
+            "num_outputs": 1,
+    },
+)
     except ReplicateError as e:
         raise HTTPException(status_code=429, detail=f"Replicate error (inpaint): {str(e)}")
 
