@@ -1,23 +1,6 @@
 import os
 import io
 import base64
-from replicate.exceptions import ReplicateError
-try:
-    seg_out = replicate.run(seg_version, input={"image": original_data_url})
-except ReplicateError as e:
-    raise HTTPException(status_code=402, detail="AI preview unavailable: Replicate billing/credits issue.")
-try:
-    out = replicate.run(img_version, input={
-        "image": original_data_url,
-        "mask": mask_url,
-        "prompt": prompt,
-        "negative_prompt": negative_prompt(),
-        "strength": float(strength),
-        "num_outputs": 1,
-    })
-except ReplicateError as e:
-    raise HTTPException(status_code=402, detail="AI preview unavailable: Replicate billing/credits issue.")
-
 from typing import Literal
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
