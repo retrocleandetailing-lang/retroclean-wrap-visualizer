@@ -3,31 +3,25 @@ import io
 import base64
 import time
 import urllib.request
-from typing import Literal, Tuple
+import hashlib
+from typing import Literal
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from PIL import Image, ImageOps, ImageFilter, ImageChops
+
+from PIL import Image, ImageOps, ImageChops, ImageEnhance, ImageFilter
 
 import replicate
 from replicate.exceptions import ReplicateError
 
 
-# ----------------------------
-# CONFIG
-# ----------------------------
-COOLDOWN_SECONDS = 45  # one click = 2 predictions (seg + inpaint)
-
-SEG_MODEL = "tmappdev/lang-segment-anything:891411c38a6ed2d44c004b7b9e44217df7a5b07848f29ddefd2e28bc7cbf93bc"
-INPAINT_MODEL = "stability-ai/stable-diffusion-inpainting:c2172c447eb69551b59f62fd2d61dd84054e9fb7bc8a42fbe398c2a7a072ed68"
-
-# SD inpainting commonly enforces these widths/heights (you saw this exact list in the 422)
-ALLOWED_DIMS = [64, 128, 192, 256, 320, 384, 448, 512, 576, 640, 704, 768, 832, 896, 960, 1024]
+# Only 1 Replicate call now (segmentation), so cooldown can be much shorter.
+COOLDOWN_SECONDS = 12
 
 Angle = Literal["front_3q", "side", "rear_3q"]
 Finish = Literal["gloss", "satin", "matte"]
 
-COLOR_MAP = {
+COLOR_NAME = {
     "nardo_grey": "Nardo Grey",
     "satin_black": "Satin Black",
     "gloss_black": "Gloss Black",
@@ -37,10 +31,17 @@ COLOR_MAP = {
     "pearl_white": "Pearl White",
 }
 
+# Hex targets for deterministic recolor
+COLOR_HEX = {
+    "nardo_grey": "#9FA4A9",
+    "satin_black": "#1A1A1A",
+    "gloss_black": "#0B0B0B",
+    "miami_blue": "#00B7D6",
+    "british_racing_green": "#0B3D2E",
+    "ruby_red": "#7A0F1C",
+    "pearl_white": "#F2F2F0",
+}
 
-# ----------------------------
-# APP
-# ----------------------------
 app = FastAPI(title="RetroClean Wrap Visualizer API")
 
 app.add_middleware(
@@ -55,12 +56,12 @@ app.add_middleware(
 )
 
 
-# ----------------------------
-# HELPERS
-# ----------------------------
-def img_to_data_url(img: Image.Image, fmt: str = "PNG") -> str:
+def img_to_data_url(img: Image.Image, fmt: str = "JPEG", quality: int = 92) -> str:
     buf = io.BytesIO()
-    img.save(buf, format=fmt)
+    if fmt.upper() == "JPEG":
+        img.save(buf, format="JPEG", quality=quality, optimize=True)
+    else:
+        img.save(buf, format=fmt)
     b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
     return f"data:image/{fmt.lower()};base64,{b64}"
 
@@ -72,105 +73,177 @@ def download_image(url: str, timeout: int = 30) -> Image.Image:
     return Image.open(io.BytesIO(data))
 
 
-def nearest_allowed(n: int) -> int:
-    # choose the closest allowed dimension, but clamp to [64..1024]
-    n = max(64, min(1024, n))
-    return min(ALLOWED_DIMS, key=lambda x: abs(x - n))
+def hex_to_rgb(hexstr: str) -> tuple[int, int, int]:
+    s = hexstr.strip().lstrip("#")
+    return (int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16))
 
 
-def fit_to_allowed_dims(img: Image.Image, target_max: int = 1024) -> Tuple[Image.Image, int, int]:
-    """
-    Resize (preserve aspect) then pad to the nearest allowed dims (fixes 422 width/height validation).
-    Returns (new_img, width, height).
-    """
-    w, h = img.size
-
-    # scale down if needed so the larger side <= target_max
-    scale = min(1.0, float(target_max) / float(max(w, h)))
-    if scale < 1.0:
-        img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
-
-    w, h = img.size
-    new_w = nearest_allowed(w)
-    new_h = nearest_allowed(h)
-
-    # pad to exact allowed dims (do NOT stretch the image)
-    pad_w = max(0, new_w - w)
-    pad_h = max(0, new_h - h)
-    left = pad_w // 2
-    right = pad_w - left
-    top = pad_h // 2
-    bottom = pad_h - top
-
-    img = ImageOps.expand(img, border=(left, top, right, bottom), fill=(0, 0, 0))
-    return img, new_w, new_h
-
-
-def build_prompt(color_name: str, finish: Finish, angle: Angle) -> str:
-    angle_hint = {
-        "front_3q": "front three-quarter angle",
-        "side": "side profile angle",
-        "rear_3q": "rear three-quarter angle",
-    }[angle]
-
-    finish_text = {
-        "gloss": "high-gloss vinyl wrap with clearcoat-like highlights",
-        "satin": "satin vinyl wrap with soft reflections",
-        "matte": "matte vinyl wrap with diffused reflections",
-    }[finish]
-
-    metallic = ""
-    if finish == "gloss":
-        metallic = (
-            "Add subtle fine metallic micro-flake ONLY inside specular highlights; "
-            "premium OEM-like finish, NOT glittery. "
-        )
-
-    return (
-        "Photorealistic edit of the SAME EXACT input photo. "
-        f"Keep the same car and same exact camera perspective ({angle_hint}), same lens, same framing, "
-        "same background, same lighting direction, same reflections SHAPE. "
-        "ONLY recolor the painted body panels (doors, fenders, hood, quarter panels, bumpers) "
-        f"to {color_name} {finish_text}. "
-        f"{metallic}"
-        "Preserve crisp panel gaps and seam lines (door lines, hood lines, trunk lines). "
-        "Do NOT modify wheels, tires, brakes, windows, windshield, trim, badges, grille, headlights, taillights, "
-        "interior, stance, body kit, or environment. "
-        "No car swapping. No changing make/model. No changing background."
-    )
-
-
-def negative_prompt() -> str:
-    return (
-        "different car, different make, different model, car swap, changed background, "
-        "changed wheels, changed windows, changed headlights, changed grille, changed body kit, "
-        "cartoon, anime, illustration, CGI, warped, melted, extra parts, text, watermark, logo, blurry, low quality"
-    )
-
-
-def clean_mask(mask_l: Image.Image) -> Image.Image:
-    """
-    Basic cleanup: autocontrast + blur + threshold + slight dilate/erode to stabilize edges.
-    White = edit, Black = keep.
-    """
-    m = mask_l.convert("L")
+def clamp_mask(mask_l: Image.Image, size: tuple[int, int]) -> Image.Image:
+    m = mask_l.resize(size).convert("L")
     m = ImageOps.autocontrast(m)
-
-    # smooth noise
-    m = m.filter(ImageFilter.GaussianBlur(radius=1.2))
-
-    # threshold to solid mask
-    m = m.point(lambda px: 255 if px > 140 else 0)
-
-    # morphological-ish cleanup using min/max filters
-    m = m.filter(ImageFilter.MaxFilter(5))  # dilate
-    m = m.filter(ImageFilter.MinFilter(3))  # erode (slightly)
+    # soften edges a bit to avoid “stair steps”
+    m = m.filter(ImageFilter.GaussianBlur(radius=1.1))
     return m
 
 
-# ----------------------------
-# ROUTES
-# ----------------------------
+def clean_mask_remove_windows_wheels(original_rgb: Image.Image, mask_l: Image.Image) -> Image.Image:
+    """
+    Heuristic cleanup to reduce windows/wheels being recolored:
+    - dark + low saturation areas inside the mask get removed
+    """
+    mask = clamp_mask(mask_l, original_rgb.size)
+
+    hsv = original_rgb.convert("HSV")
+    _, s, v = hsv.split()
+
+    # thresholds tuned for typical car photos
+    dark = v.point(lambda px: 255 if px < 60 else 0)
+    lowsat = s.point(lambda px: 255 if px < 45 else 0)
+
+    # areas likely to be windows/wheels = dark AND low sat
+    win_wheel = ImageChops.multiply(dark, lowsat)
+
+    # remove those areas from mask
+    win_wheel_inv = ImageOps.invert(win_wheel)
+    cleaned = ImageChops.multiply(mask, win_wheel_inv)
+
+    # tighten + smooth
+    cleaned = cleaned.filter(ImageFilter.GaussianBlur(radius=1.0))
+    cleaned = cleaned.point(lambda px: 255 if px > 95 else 0)
+
+    return cleaned
+
+
+def make_panel_lines(original_rgb: Image.Image, mask_l: Image.Image) -> Image.Image:
+    """
+    Panel separation: accentuate existing edges (door lines, hood lines) only on painted area.
+    We DO NOT invent new lines; we just boost the ones already present.
+    """
+    gray = ImageOps.grayscale(original_rgb)
+    edges = gray.filter(ImageFilter.FIND_EDGES)
+    edges = ImageOps.autocontrast(edges)
+
+    # keep only “strong” edges
+    edges = edges.point(lambda px: 255 if px > 140 else 0)
+    edges = edges.filter(ImageFilter.GaussianBlur(radius=0.6))
+
+    # restrict to masked paint area
+    edges = ImageChops.multiply(edges, mask_l)
+
+    return edges
+
+
+def make_highlight_map(original_rgb: Image.Image, mask_l: Image.Image) -> Image.Image:
+    """
+    Clearcoat highlights: extract bright specular regions from original, then use as a map.
+    """
+    gray = ImageOps.grayscale(original_rgb)
+    # high-pass-ish: emphasize local contrast
+    blur = gray.filter(ImageFilter.GaussianBlur(radius=6))
+    hi = ImageChops.subtract(gray, blur)
+    hi = ImageOps.autocontrast(hi)
+
+    # focus on brighter features
+    hi = hi.point(lambda px: 255 if px > 155 else 0)
+    hi = hi.filter(ImageFilter.GaussianBlur(radius=2.0))
+
+    # restrict to paint mask
+    hi = ImageChops.multiply(hi, mask_l)
+    return hi
+
+
+def screen_blend(base: Image.Image, top: Image.Image, top_alpha_l: Image.Image) -> Image.Image:
+    """
+    Screen blend top over base, controlled by alpha (L image).
+    """
+    base = base.convert("RGB")
+    top = top.convert("RGB")
+    alpha = top_alpha_l.convert("L")
+
+    # screen = 255 - ( (255-base)*(255-top) / 255 )
+    inv_base = ImageOps.invert(base)
+    inv_top = ImageOps.invert(top)
+    mult = ImageChops.multiply(inv_base, inv_top)
+    screen = ImageOps.invert(mult)
+
+    return Image.composite(screen, base, alpha)
+
+
+def recolor_body(
+    original_rgb: Image.Image,
+    mask_l: Image.Image,
+    target_rgb: tuple[int, int, int],
+    finish: Finish,
+    intensity: float,
+    seed: int,
+) -> Image.Image:
+    """
+    Deterministic recolor preserving shading and reflections.
+    Adds: panel line separation, clearcoat highlights, metallic flake (gloss only).
+    """
+
+    intensity = max(0.10, min(float(intensity), 0.95))
+
+    # base shading from original
+    base_gray = ImageOps.grayscale(original_rgb)
+
+    # colorize shading to target
+    colored = ImageOps.colorize(base_gray, black=(0, 0, 0), white=target_rgb).convert("RGB")
+
+    # blend target onto original inside mask (preserves reflections shape)
+    blended = Image.blend(original_rgb, colored, intensity)
+    wrapped = Image.composite(blended, original_rgb, mask_l)
+
+    # panel lines
+    panel_lines = make_panel_lines(original_rgb, mask_l)
+    # darken panel lines subtly
+    panel_dark = ImageOps.colorize(panel_lines, black=(0, 0, 0), white=(0, 0, 0)).convert("RGB")
+    wrapped = Image.composite(ImageChops.subtract(wrapped, panel_dark), wrapped, panel_lines)
+
+    # clearcoat highlight map
+    hi = make_highlight_map(original_rgb, mask_l)
+
+    if finish == "gloss":
+        # stronger clearcoat highlight
+        hi_stronger = ImageEnhance.Brightness(hi).enhance(1.15)
+        hi_stronger = ImageEnhance.Contrast(hi_stronger).enhance(1.35)
+
+        # white highlight layer
+        white = Image.new("RGB", wrapped.size, (255, 255, 255))
+        wrapped = screen_blend(wrapped, white, hi_stronger)
+
+        # metallic flake: subtle micro-sparkle only in highlights
+        # procedural noise, seeded by image+color for consistency
+        flake = Image.effect_noise(wrapped.size, 18)  # 0-255 noise
+        flake = flake.filter(ImageFilter.GaussianBlur(radius=0.7))
+        flake = ImageEnhance.Contrast(flake).enhance(2.1)
+        flake = flake.point(lambda px: 255 if px > 235 else 0)  # tiny specks
+
+        # only appear where highlights are (and inside mask)
+        flake = ImageChops.multiply(flake, hi_stronger)
+        flake = flake.point(lambda px: 255 if px > 40 else 0)
+
+        wrapped = screen_blend(wrapped, white, flake)
+
+        wrapped = ImageEnhance.Contrast(wrapped).enhance(1.06)
+        wrapped = ImageEnhance.Color(wrapped).enhance(1.08)
+
+    elif finish == "satin":
+        hi_soft = ImageEnhance.Brightness(hi).enhance(0.95)
+        hi_soft = hi_soft.filter(ImageFilter.GaussianBlur(radius=1.5))
+        white = Image.new("RGB", wrapped.size, (245, 245, 245))
+        wrapped = screen_blend(wrapped, white, hi_soft)
+        wrapped = ImageEnhance.Contrast(wrapped).enhance(1.02)
+        wrapped = ImageEnhance.Color(wrapped).enhance(1.03)
+
+    else:  # matte
+        # matte: suppress highlights a little
+        wrapped = ImageEnhance.Contrast(wrapped).enhance(0.97)
+        wrapped = ImageEnhance.Color(wrapped).enhance(0.95)
+
+    return wrapped
+
+
 @app.get("/")
 def root():
     return {"message": "RetroClean Wrap Visualizer API. Use /health or POST /render."}
@@ -184,56 +257,64 @@ def health():
 @app.post("/render")
 async def render(
     image: UploadFile = File(...),
-    angle: Angle = Form(...),
+    angle: Angle = Form(...),      # kept for your UI; not required for recolor
     color: str = Form(...),
     finish: Finish = Form(...),
-    strength: float = Form(0.28),  # default low to prevent re-imagining the entire car
+    strength: float = Form(0.55),  # becomes recolor intensity (NOT diffusion strength)
 ):
-    # cooldown (server-side)
+    # cooldown
     now = time.time()
     last = getattr(app.state, "last_call_ts", 0.0)
     if now - last < COOLDOWN_SECONDS:
         raise HTTPException(status_code=429, detail=f"Too many requests. Please wait ~{COOLDOWN_SECONDS}s and try again.")
     app.state.last_call_ts = now
 
-    if color not in COLOR_MAP:
+    if color not in COLOR_NAME or color not in COLOR_HEX:
         raise HTTPException(status_code=400, detail="Unsupported color.")
 
-    # token required
-    token = os.getenv("REPLICATE_API_TOKEN")
-    if not token:
-        raise HTTPException(status_code=500, detail="Missing REPLICATE_API_TOKEN on server.")
-    os.environ["REPLICATE_API_TOKEN"] = token
-
-    # read & validate image
+    # Load image
     try:
         raw = await image.read()
         pil = Image.open(io.BytesIO(raw)).convert("RGB")
-        if pil.size[0] < 700 or pil.size[1] < 700:
-            raise HTTPException(status_code=400, detail="Photo too small. Please use a higher-resolution photo.")
+        w, h = pil.size
+        if w < 900 or h < 900:
+            raise HTTPException(status_code=400, detail="Photo too small. Use at least ~900px on each side.")
+        # keep reasonable CPU cost
+        if w > 2200 or h > 2200:
+            pil.thumbnail((2200, 2200))
     except HTTPException:
         raise
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid image file.")
 
-    # fit to allowed dims for SD-inpaint (fixes 422 width/height)
-    pil, out_w, out_h = fit_to_allowed_dims(pil, target_max=1024)
+    # Env vars
+    token = os.getenv("REPLICATE_API_TOKEN")
+    seg_version = os.getenv("REPLICATE_SEG_VERSION")
 
-    # build urls
-    original_data_url = img_to_data_url(pil, fmt="PNG")
+    if not token:
+        raise HTTPException(status_code=500, detail="Missing REPLICATE_API_TOKEN on server.")
+    if not seg_version:
+        raise HTTPException(status_code=500, detail="Missing REPLICATE_SEG_VERSION on server.")
 
-    # 1) segmentation
+    os.environ["REPLICATE_API_TOKEN"] = token
+
+    # Original for response (before) + segmentation input
+    before_data_url = img_to_data_url(pil, fmt="JPEG", quality=92)
+    seg_input_data_url = img_to_data_url(pil, fmt="PNG")
+
+    # 1) Segmentation
     try:
         seg_out = replicate.run(
-            SEG_MODEL,
+            seg_version,
             input={
-                "image": original_data_url,
-                "text_prompt": "car body panels",  # tighter than "car"
+                "image": seg_input_data_url,
+                "text_prompt": "car body panels",
             },
         )
     except ReplicateError as e:
         raise HTTPException(status_code=429, detail=f"Replicate error (segmentation): {str(e)}")
 
+    # Extract mask URL
     mask_url = None
     if isinstance(seg_out, dict):
         mask_url = seg_out.get("mask") or seg_out.get("output") or seg_out.get("mask_url")
@@ -245,64 +326,37 @@ async def render(
     if not mask_url:
         raise HTTPException(status_code=500, detail="Segmentation failed (no mask returned).")
 
-    # download + clean mask, then force size match
+    # Download mask
     try:
         mask_img = download_image(mask_url).convert("L")
-        mask_img = mask_img.resize((out_w, out_h), Image.NEAREST)
-        mask_img = clean_mask(mask_img)
     except Exception:
-        raise HTTPException(status_code=500, detail="Could not download/prepare segmentation mask.")
+        raise HTTPException(status_code=500, detail="Could not download segmentation mask.")
 
-    # IMPORTANT: inpainting expects white=edit, black=keep
-    # If your mask comes inverted, toggle this line:
-    # mask_img = ImageOps.invert(mask_img)
-
-    mask_data_url = img_to_data_url(mask_img, fmt="PNG")
-
-    # Replicate “burst=1” behavior can still 429 if you chain calls too fast
-    time.sleep(10)
-
-    # 2) inpaint (heavy constraints)
-    prompt = build_prompt(COLOR_MAP[color], finish, angle)
-
-    # clamp strength to a safe band
-    strength = float(strength)
-    strength = max(0.18, min(0.40, strength))
-
-    # NOTE: the stability-ai/stable-diffusion-inpainting model supports width/height.
-    # If your run still complains, we’ll adjust the parameter names to match the model schema.
+    # Clean mask
     try:
-        out = replicate.run(
-            INPAINT_MODEL,
-            input={
-                "image": original_data_url,
-                "mask": mask_data_url,
-                "prompt": prompt,
-                "negative_prompt": negative_prompt(),
-                "strength": strength,
+        cleaned = clean_mask_remove_windows_wheels(pil, mask_img)
+    except Exception:
+        cleaned = clamp_mask(mask_img, pil.size)
 
-                # critical: lock image structure
-                "guidance_scale": 5.5,          # higher = more “creative” (bad for car identity)
-                "num_inference_steps": 28,
+    # seed for deterministic flake “feel”
+    h = hashlib.sha256(raw + color.encode("utf-8") + finish.encode("utf-8")).hexdigest()
+    seed = int(h[:8], 16)
 
-                # fix 422 dimension validation
-                "width": out_w,
-                "height": out_h,
+    target_rgb = hex_to_rgb(COLOR_HEX[color])
 
-                "num_outputs": 1,
-            },
-        )
-    except ReplicateError as e:
-        raise HTTPException(status_code=422 if "Input validation failed" in str(e) else 429,
-                            detail=f"Replicate error (inpaint): {str(e)}")
+    after_img = recolor_body(
+        original_rgb=pil,
+        mask_l=cleaned,
+        target_rgb=target_rgb,
+        finish=finish,
+        intensity=float(strength),
+        seed=seed,
+    )
 
-    result_url = None
-    if isinstance(out, list) and out:
-        result_url = out[0]
-    elif isinstance(out, str):
-        result_url = out
+    after_data_url = img_to_data_url(after_img, fmt="JPEG", quality=92)
 
-    if not result_url:
-        raise HTTPException(status_code=500, detail="Render failed (no image returned).")
-
-    return {"before": original_data_url, "after": result_url, "mask": mask_url}
+    return {
+        "before": before_data_url,
+        "after": after_data_url,
+        "mask": mask_url,  # keep for debugging
+    }
