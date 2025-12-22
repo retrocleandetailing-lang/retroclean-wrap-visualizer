@@ -182,7 +182,7 @@ async def render(
         }
 
     # Brief delay to avoid rate limiting
-    time.sleep(5)
+    time.sleep(10)
 
     # --- STEP 2: INPAINT WITH NEW COLOR ---
     try:
