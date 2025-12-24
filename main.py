@@ -41,12 +41,14 @@ app.add_middleware(
     allow_origins=[
         "https://retrocleandetailing.com",
         "https://www.retrocleandetailing.com",
-    ],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex=r"^https:\/\/.*\.webflow\.io$|^https:\/\/preview\.webflow\.com$",
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
+    max_age=86400,
 )
-
 
 def to_64(x: int) -> int:
     """Round dimension to nearest multiple of 64 for SD compatibility."""
