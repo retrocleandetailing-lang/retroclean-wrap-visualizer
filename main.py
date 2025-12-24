@@ -6,14 +6,14 @@ import urllib.request
 from typing import Literal, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image, ImageOps, ImageFilter
 
 import replicate
 from replicate.exceptions import ReplicateError
 
-# Load environment variables from .env file (local dev)
+# Load .env locally (Render ignores unless you add env vars in dashboard)
 load_dotenv()
 
 # -----------------------------
@@ -34,13 +34,12 @@ COLOR_MAP = {
     "pearl_white": "Pearl White",
 }
 
-# Use env var REPLICATE_IMG_VERSION for your model; fallback is SDXL inpaint
+# Default fallback if REPLICATE_IMG_VERSION isn't set (works, but not ControlNet)
 DEFAULT_INPAINT_MODEL = (
     "stability-ai/sdxl:39ed52f2a78e934b3ba6e2a89f5b1c712de7dfea535525255b1aa35c5565e08b"
 )
 
-# If you don’t set REPLICATE_SEG_VERSION, you can optionally set a default here.
-# Leaving None so you are forced to configure it properly in Render.
+# You can set this in Render as REPLICATE_SEG_VERSION
 DEFAULT_SEG_MODEL: Optional[str] = None
 
 
@@ -49,14 +48,19 @@ DEFAULT_SEG_MODEL: Optional[str] = None
 # -----------------------------
 app = FastAPI(title="RetroClean Wrap Visualizer API")
 
-# CORS: allow your live domains + Webflow staging/preview
+# CORS: live domains + ALL Webflow staging/preview patterns
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://retrocleandetailing.com",
         "https://www.retrocleandetailing.com",
     ],
-    allow_origin_regex=r"^https:\/\/.*\.webflow\.io$|^https:\/\/preview\.webflow\.com$",
+    # Covers:
+    # - https://yourproject.webflow.io
+    # - https://preview.webflow.com
+    # - https://*.webflow.com (various preview tooling)
+    # - https://webflow.com
+    allow_origin_regex=r"^https:\/\/.*\.webflow\.io$|^https:\/\/preview\.webflow\.com$|^https:\/\/.*\.webflow\.com$|^https:\/\/webflow\.com$",
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -69,12 +73,11 @@ app.add_middleware(
 # Helpers
 # -----------------------------
 def to_64(x: int) -> int:
-    """Round dimension down to nearest multiple of 64 for SD compatibility."""
+    """Round dimension down to nearest multiple of 64 (SDXL-friendly)."""
     return max(64, (x // 64) * 64)
 
 
 def img_to_data_url(img: Image.Image) -> str:
-    """Convert PIL Image to base64 data URL."""
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
@@ -82,14 +85,12 @@ def img_to_data_url(img: Image.Image) -> str:
 
 
 def download_image(url: str) -> Image.Image:
-    """Download image from URL and return as PIL Image."""
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req, timeout=30) as resp:
         return Image.open(io.BytesIO(resp.read()))
 
 
 def build_prompt(color: str, finish: Finish, angle: Angle) -> str:
-    """Build a tight inpainting prompt for wrap color."""
     finish_text = {
         "gloss": "high-gloss vinyl wrap with realistic reflections",
         "satin": "satin vinyl wrap with soft sheen",
@@ -112,7 +113,6 @@ def build_prompt(color: str, finish: Finish, angle: Angle) -> str:
 
 
 def negative_prompt() -> str:
-    """Negative prompt to avoid unwanted changes."""
     return (
         "different car, different vehicle, change wheels, change rims, change tires, "
         "change windows, change grille, change headlights, change taillights, "
@@ -124,10 +124,7 @@ def negative_prompt() -> str:
 
 def prepare_mask_for_inpainting(mask: Image.Image) -> Image.Image:
     """
-    Prepare mask for inpainting. Standard convention:
-    - WHITE (255) = area to CHANGE
-    - BLACK (0) = area to KEEP
-    Keep mask crisp to prevent “bleed” onto trim/badges.
+    WHITE = change, BLACK = keep. Keep it crisp to avoid bleed.
     """
     m = mask.convert("L")
     m = ImageOps.autocontrast(m)
@@ -138,10 +135,6 @@ def prepare_mask_for_inpainting(mask: Image.Image) -> Image.Image:
 
 
 def get_models() -> tuple[str, str]:
-    """
-    Returns (seg_model, inpaint_model).
-    Enforces required env vars to avoid silent misconfig.
-    """
     token = os.getenv("REPLICATE_API_TOKEN")
     if not token:
         raise HTTPException(500, "Missing REPLICATE_API_TOKEN.")
@@ -152,13 +145,13 @@ def get_models() -> tuple[str, str]:
 
     inpaint_model = os.getenv("REPLICATE_IMG_VERSION", DEFAULT_INPAINT_MODEL)
 
-    # Replicate SDK reads token from env; set it explicitly
+    # Replicate SDK reads from env
     os.environ["REPLICATE_API_TOKEN"] = token
     return seg_model, inpaint_model
 
 
 # -----------------------------
-# Routes
+# Debug / Health
 # -----------------------------
 @app.get("/health")
 async def health():
@@ -170,6 +163,22 @@ async def cors_test():
     return {"ok": True}
 
 
+@app.get("/debug-origin")
+async def debug_origin(request: Request):
+    """
+    Call this from the Webflow page console to see what Origin is being sent.
+    If fetch fails, it's still CORS/network before FastAPI is reached.
+    """
+    return {
+        "origin": request.headers.get("origin"),
+        "host": request.headers.get("host"),
+        "user_agent": request.headers.get("user-agent"),
+    }
+
+
+# -----------------------------
+# Main endpoint
+# -----------------------------
 @app.post("/render")
 async def render(
     image: UploadFile = File(...),
@@ -178,10 +187,6 @@ async def render(
     finish: Finish = Form(...),
     debug: bool = Form(False),
 ):
-    """
-    1) Segment car body panels
-    2) Inpaint ONLY those panels to chosen color/finish
-    """
     # Cooldown
     now = time.time()
     last = getattr(app.state, "last_call", 0.0)
@@ -194,21 +199,21 @@ async def render(
 
     seg_model, inpaint_model = get_models()
 
-    # Read image
+    # Read uploaded image
     raw = await image.read()
     try:
         base = Image.open(io.BytesIO(raw)).convert("RGB")
     except Exception:
         raise HTTPException(400, "Invalid image file.")
 
-    # Resize to SD-safe multiples of 64 (for SDXL-style models)
+    # Resize for SDXL-style inpainting models
     w, h = base.size
     new_w, new_h = to_64(w), to_64(h)
     base = base.resize((new_w, new_h), Image.Resampling.LANCZOS)
 
     base_url = img_to_data_url(base)
 
-    # STEP 1: segmentation (tight prompt)
+    # STEP 1: Segmentation (tight prompt)
     seg_prompt = (
         "car painted body panels only, doors, hood, fenders, quarter panels, roof, bumpers, "
         "exclude windows, windshield, grille, headlights, taillights, wheels, tires, badges, logo"
@@ -244,11 +249,11 @@ async def render(
             "seg_model": seg_model,
             "inpaint_model": inpaint_model,
         }
-        
+
     # Brief delay to avoid rate limiting
     time.sleep(10)
     
-    # STEP 2: inpainting
+    # STEP 2: Inpaint
     try:
         inpaint_out = replicate.run(
             inpaint_model,
@@ -269,7 +274,4 @@ async def render(
 
     result_url = inpaint_out[0] if isinstance(inpaint_out, list) else inpaint_out
 
-    return {
-        "before": base_url,
-        "after": result_url,
-    }
+    return {"before": base_url, "after": result_url}
